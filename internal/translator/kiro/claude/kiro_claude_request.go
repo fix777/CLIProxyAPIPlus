@@ -231,15 +231,35 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, isA
 	// When set to "enabled", Kiro returns reasoning content as official reasoningContentEvent
 	// rather than inline <thinking> tags in assistantResponseEvent.
 	// We cap max_thinking_length to reserve space for tool outputs and prevent truncation.
+	// The max_thinking_length value is derived from Claude's thinking.budget_tokens if provided.
 	if thinkingEnabled {
-		thinkingHint := `<thinking_mode>enabled</thinking_mode>
-<max_thinking_length>16000</max_thinking_length>`
-		if systemPrompt != "" {
-			systemPrompt = thinkingHint + "\n\n" + systemPrompt
+		// Check if system prompt already contains thinking tags (avoid duplicate injection)
+		if !strings.Contains(systemPrompt, "<thinking_mode>") &&
+			!strings.Contains(systemPrompt, "<max_thinking_length>") {
+
+			// Default to 16000 to cap thinking and reserve space for tool outputs
+			maxThinkingLength := 16000
+
+			// Check if budget_tokens is explicitly provided in the request
+			thinkingField := gjson.GetBytes(claudeBody, "thinking.budget_tokens")
+			if thinkingField.Exists() {
+				budgetTokens := thinkingField.Int()
+				if budgetTokens > 0 {
+					maxThinkingLength = int(budgetTokens)
+				}
+			}
+
+			thinkingHint := fmt.Sprintf(`<thinking_mode>enabled</thinking_mode>
+<max_thinking_length>%d</max_thinking_length>`, maxThinkingLength)
+			if systemPrompt != "" {
+				systemPrompt = thinkingHint + "\n\n" + systemPrompt
+			} else {
+				systemPrompt = thinkingHint
+			}
+			log.Infof("kiro: injected thinking prompt (official mode), max_thinking_length: %d, has_tools: %v", maxThinkingLength, len(kiroTools) > 0)
 		} else {
-			systemPrompt = thinkingHint
+			log.Debugf("kiro: skipping thinking injection, tags already present in system prompt")
 		}
-		log.Infof("kiro: injected thinking prompt (official mode), has_tools: %v", len(kiroTools) > 0)
 	}
 
 	// Process messages and build history
