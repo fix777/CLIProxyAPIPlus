@@ -1,6 +1,12 @@
 // Package common provides shared constants and utilities for Kiro translator.
 package common
 
+import (
+	"strings"
+
+	log "github.com/sirupsen/logrus"
+)
+
 const (
 	// KiroMaxToolDescLen is the maximum description length for Kiro API tools.
 	// Kiro API limit is 10240 bytes, leave room for "..."
@@ -100,4 +106,34 @@ You MUST follow these rules for ALL file operations. Violation causes server tim
 - Failed writes waste time and require retry
 
 REMEMBER: When in doubt, write LESS per operation. Multiple small operations > one large operation.`
+
+	// ThinkingStartTagEscaped is the unicode-escaped version of the thinking start tag.
+	// Kiro upstream may respond with this format: \u003cthinking\u003e
+	ThinkingStartTagEscaped = `\u003cthinking\u003e`
+
+	// ThinkingEndTagEscaped is the unicode-escaped version of the thinking end tag.
+	// Kiro upstream may respond with this format: \u003c/thinking\u003e
+	ThinkingEndTagEscaped = `\u003c/thinking\u003e`
 )
+
+// NormalizeThinkingTags converts unicode-escaped thinking tags to their normal form.
+// This handles cases where Kiro upstream responds with \u003cthinking\u003e format
+// instead of <thinking> format.
+func NormalizeThinkingTags(content string) string {
+	if !strings.Contains(content, `\u003c`) {
+		return content
+	}
+
+	log.Debugf("kiro: found unicode-escaped content, normalizing thinking tags (len: %d)", len(content))
+
+	result := strings.ReplaceAll(content, ThinkingStartTagEscaped, ThinkingStartTag)
+	result = strings.ReplaceAll(result, ThinkingEndTagEscaped, ThinkingEndTag)
+
+	if result != content {
+		log.Debugf("kiro: normalized thinking tags - start tags: %d, end tags: %d",
+			strings.Count(result, ThinkingStartTag)-strings.Count(content, ThinkingStartTag),
+			strings.Count(result, ThinkingEndTag)-strings.Count(content, ThinkingEndTag))
+	}
+
+	return result
+}

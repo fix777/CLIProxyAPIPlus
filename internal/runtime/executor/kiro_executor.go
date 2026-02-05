@@ -2957,6 +2957,10 @@ func (e *KiroExecutor) streamToChannel(ctx context.Context, body io.Reader, out 
 				}
 
 				// TAG-BASED THINKING PARSING: Parse <thinking> tags from content
+				// Normalize unicode-escaped thinking tags (e.g., \u003cthinking\u003e -> <thinking>)
+				// Kiro upstream may respond with these escaped formats
+				contentDelta = kirocommon.NormalizeThinkingTags(contentDelta)
+
 				// Combine pending content with new content for processing
 				pendingContent.WriteString(contentDelta)
 				processContent := pendingContent.String()

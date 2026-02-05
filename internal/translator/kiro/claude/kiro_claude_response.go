@@ -139,6 +139,9 @@ func ExtractThinkingFromContent(content string) []map[string]interface{} {
 		return blocks
 	}
 
+	// Normalize unicode-escaped thinking tags from Kiro upstream
+	content = kirocommon.NormalizeThinkingTags(content)
+
 	// Check if content contains thinking tags at all
 	if !strings.Contains(content, thinkingStartTag) {
 		// No thinking tags, return as plain text
