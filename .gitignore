@@ -1,5 +1,5 @@
 # Binaries
-cli-proxy-api-plus
+cli-proxy-api-plus*
 cli-proxy-api
 cliproxy
 *.exe
@@ -50,6 +50,7 @@ GEMINI.md
 _bmad/*
 _bmad-output/*
 .mcp/cache/
+.sisyphus/
 
 # macOS
 .DS_Store

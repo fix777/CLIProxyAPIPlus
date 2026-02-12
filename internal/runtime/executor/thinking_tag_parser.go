@@ -3,6 +3,7 @@ package executor
 import (
 	"strings"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -44,8 +45,12 @@ type ThinkingTagParser struct {
 }
 
 func NewThinkingTagParser(modelName string) *ThinkingTagParser {
+	active := strings.Contains(strings.ToLower(modelName), "claude")
+	if active {
+		log.Debugf("antigravity executor: thinking tag parser activated for model: %s", modelName)
+	}
 	return &ThinkingTagParser{
-		active: strings.Contains(strings.ToLower(modelName), "claude"),
+		active: active,
 	}
 }
 
@@ -61,6 +66,8 @@ func (p *ThinkingTagParser) Process(payload []byte) []byte {
 	if len(payload) == 0 || !gjson.ValidBytes(payload) {
 		return payload
 	}
+
+	log.Debugf("antigravity executor: thinking tag parser processing payload (%d bytes), inThinking=%v, tagBuffer=%q", len(payload), p.inThinking, p.tagBuffer)
 
 	partsResult := gjson.GetBytes(payload, "response.candidates.0.content.parts")
 	if !partsResult.Exists() || !partsResult.IsArray() {
@@ -88,6 +95,7 @@ func (p *ThinkingTagParser) Process(payload []byte) []byte {
 		originalText := part.Get("text").String()
 		text := originalText
 		if p.tagBuffer != "" {
+			log.Debugf("antigravity executor: thinking tag parser prepending buffered tag: %q", p.tagBuffer)
 			text = p.tagBuffer + text
 			p.tagBuffer = ""
 		}
@@ -114,6 +122,7 @@ func (p *ThinkingTagParser) Process(payload []byte) []byte {
 		}
 
 		changed = true
+		log.Debugf("antigravity executor: thinking tag parser split chunk into %d segments", len(segments))
 		for _, segment := range segments {
 			if segment.text == "" {
 				continue
@@ -134,8 +143,10 @@ func (p *ThinkingTagParser) Process(payload []byte) []byte {
 	partsJSON := "[" + strings.Join(updatedParts, ",") + "]"
 	updated, err := sjson.SetRawBytes(payload, "response.candidates.0.content.parts", []byte(partsJSON))
 	if err != nil {
+		log.Errorf("antigravity executor: thinking tag parser failed to set updated parts: %v", err)
 		return payload
 	}
+	log.Debugf("antigravity executor: thinking tag parser rewrote parts (%d parts)", len(updatedParts))
 	return updated
 }
 
@@ -156,12 +167,14 @@ func (p *ThinkingTagParser) splitThinkingText(text string) []thinkingTextSegment
 				}
 				remaining = remaining[endIdx+len(thinkingEndTag):]
 				p.inThinking = false
+				log.Debugf("antigravity executor: thinking tag parser found </thinking>, exiting thinking state")
 				continue
 			}
 
 			trimmed, buffer := splitTrailingPartialTag(remaining, thinkingEndPartials)
 			if buffer != "" {
 				p.tagBuffer = buffer
+				log.Debugf("antigravity executor: thinking tag parser buffered partial end tag: %q", buffer)
 			}
 			if trimmed != "" {
 				segments = append(segments, thinkingTextSegment{text: trimmed, thought: true})
@@ -177,12 +190,14 @@ func (p *ThinkingTagParser) splitThinkingText(text string) []thinkingTextSegment
 			}
 			remaining = remaining[startIdx+len(thinkingStartTag):]
 			p.inThinking = true
+			log.Debugf("antigravity executor: thinking tag parser found <thinking>, entering thinking state")
 			continue
 		}
 
 		trimmed, buffer := splitTrailingPartialTag(remaining, thinkingStartPartials)
 		if buffer != "" {
 			p.tagBuffer = buffer
+			log.Debugf("antigravity executor: thinking tag parser buffered partial start tag: %q", buffer)
 		}
 		if trimmed != "" {
 			segments = append(segments, thinkingTextSegment{text: trimmed, thought: false})
