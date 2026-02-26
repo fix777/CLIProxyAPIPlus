@@ -353,10 +353,18 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, maxScannerBufferSize)
 		var param any
+		var responsesStreamNormalizer *githubCopilotResponsesSSENormalizer
+		if useResponses && from.String() != "claude" {
+			responsesStreamNormalizer = newGitHubCopilotResponsesSSENormalizer()
+		}
 
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			appendAPIResponseChunk(ctx, e.cfg, line)
+			effectiveLines := [][]byte{line}
+			if responsesStreamNormalizer != nil {
+				effectiveLines = responsesStreamNormalizer.NormalizeLine(line)
+			}
 
 			// Parse SSE data
 			if bytes.HasPrefix(line, dataTag) {
@@ -377,7 +385,12 @@ func (e *GitHubCopilotExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 			if useResponses && from.String() == "claude" {
 				chunks = translateGitHubCopilotResponsesStreamToClaude(bytes.Clone(line), &param)
 			} else {
-				chunks = sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), body, bytes.Clone(line), &param)
+				for _, effectiveLine := range effectiveLines {
+					translated := sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), body, bytes.Clone(effectiveLine), &param)
+					if len(translated) > 0 {
+						chunks = append(chunks, translated...)
+					}
+				}
 			}
 			for i := range chunks {
 				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
@@ -909,6 +922,151 @@ type githubCopilotResponsesStreamToolState struct {
 	Index int
 	ID    string
 	Name  string
+}
+
+type githubCopilotResponsesSSENormalizer struct {
+	outputItemIDByIndex map[int]string
+	pendingByOutput     map[int][][]byte
+}
+
+func newGitHubCopilotResponsesSSENormalizer() *githubCopilotResponsesSSENormalizer {
+	return &githubCopilotResponsesSSENormalizer{
+		outputItemIDByIndex: make(map[int]string),
+		pendingByOutput:     make(map[int][][]byte),
+	}
+}
+
+func (n *githubCopilotResponsesSSENormalizer) NormalizeLine(line []byte) [][]byte {
+	if n == nil || !bytes.HasPrefix(line, dataTag) {
+		return [][]byte{line}
+	}
+	payload := bytes.TrimSpace(line[len(dataTag):])
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) || !gjson.ValidBytes(payload) {
+		return [][]byte{line}
+	}
+
+	eventType := gjson.GetBytes(payload, "type").String()
+	if eventType == "response.output_item.added" {
+		return n.handleOutputItemAdded(line, payload)
+	}
+	if eventType == "response.output_item.done" {
+		return n.handleOutputItemDone(line, payload)
+	}
+
+	if !shouldNormalizeResponsesItemEvent(payload) {
+		return [][]byte{line}
+	}
+
+	outputIndex := int(gjson.GetBytes(payload, "output_index").Int())
+	if outputItemID := n.outputItemIDByIndex[outputIndex]; outputItemID != "" {
+		return [][]byte{rewriteSSELineItemID(line, outputItemID)}
+	}
+
+	buffered := bytes.Clone(line)
+	n.pendingByOutput[outputIndex] = append(n.pendingByOutput[outputIndex], buffered)
+	return nil
+}
+
+func (n *githubCopilotResponsesSSENormalizer) handleOutputItemAdded(line []byte, payload []byte) [][]byte {
+	outputIndexResult := gjson.GetBytes(payload, "output_index")
+	itemID := gjson.GetBytes(payload, "item.id").String()
+	if !outputIndexResult.Exists() || itemID == "" {
+		return [][]byte{line}
+	}
+
+	outputIndex := int(outputIndexResult.Int())
+	canonicalItemID := n.outputItemIDByIndex[outputIndex]
+	if canonicalItemID == "" {
+		canonicalItemID = itemID
+		n.outputItemIDByIndex[outputIndex] = canonicalItemID
+	}
+
+	normalizedLine := line
+	if canonicalItemID != itemID {
+		normalizedLine = rewriteSSELineField(line, "item.id", canonicalItemID)
+	}
+
+	out := [][]byte{normalizedLine}
+	if pending := n.pendingByOutput[outputIndex]; len(pending) > 0 {
+		for _, buffered := range pending {
+			out = append(out, rewriteSSELineItemID(buffered, canonicalItemID))
+		}
+		delete(n.pendingByOutput, outputIndex)
+	}
+	return out
+}
+
+func (n *githubCopilotResponsesSSENormalizer) handleOutputItemDone(line []byte, payload []byte) [][]byte {
+	outputIndexResult := gjson.GetBytes(payload, "output_index")
+	itemID := gjson.GetBytes(payload, "item.id").String()
+	if !outputIndexResult.Exists() || itemID == "" {
+		return [][]byte{line}
+	}
+
+	outputIndex := int(outputIndexResult.Int())
+	canonicalItemID := n.outputItemIDByIndex[outputIndex]
+	usedDoneAsCanonical := false
+	if canonicalItemID == "" {
+		canonicalItemID = itemID
+		n.outputItemIDByIndex[outputIndex] = canonicalItemID
+		usedDoneAsCanonical = true
+	}
+
+	normalizedDoneLine := line
+	if canonicalItemID != itemID {
+		normalizedDoneLine = rewriteSSELineField(line, "item.id", canonicalItemID)
+	}
+
+	pending := n.pendingByOutput[outputIndex]
+	if len(pending) == 0 {
+		return [][]byte{normalizedDoneLine}
+	}
+
+	out := make([][]byte, 0, len(pending)+2)
+	if usedDoneAsCanonical {
+		syntheticAdded := rewriteSSELineField(normalizedDoneLine, "type", "response.output_item.added")
+		out = append(out, syntheticAdded)
+	}
+	for _, buffered := range pending {
+		out = append(out, rewriteSSELineItemID(buffered, canonicalItemID))
+	}
+	out = append(out, normalizedDoneLine)
+	delete(n.pendingByOutput, outputIndex)
+	return out
+}
+
+func shouldNormalizeResponsesItemEvent(payload []byte) bool {
+	if !gjson.GetBytes(payload, "item_id").Exists() || !gjson.GetBytes(payload, "output_index").Exists() {
+		return false
+	}
+	eventType := gjson.GetBytes(payload, "type").String()
+	if !strings.HasPrefix(eventType, "response.") {
+		return false
+	}
+	return eventType != "response.output_item.added" && eventType != "response.output_item.done"
+}
+
+func rewriteSSELineItemID(line []byte, itemID string) []byte {
+	return rewriteSSELineField(line, "item_id", itemID)
+}
+
+func rewriteSSELineField(line []byte, path string, value any) []byte {
+	if !bytes.HasPrefix(line, dataTag) {
+		return line
+	}
+	payload := bytes.TrimSpace(line[len(dataTag):])
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return line
+	}
+	rewrittenPayload, err := sjson.SetBytes(payload, path, value)
+	if err != nil {
+		return line
+	}
+	rewritten := make([]byte, 0, len(dataTag)+1+len(rewrittenPayload))
+	rewritten = append(rewritten, dataTag...)
+	rewritten = append(rewritten, ' ')
+	rewritten = append(rewritten, rewrittenPayload...)
+	return rewritten
 }
 
 type githubCopilotResponsesStreamState struct {

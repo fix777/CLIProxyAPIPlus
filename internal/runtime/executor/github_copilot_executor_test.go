@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"net/http"
 	"strings"
 	"testing"
@@ -8,6 +9,170 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
 )
+
+func normalizedSSEItemID(t *testing.T, line []byte) string {
+	t.Helper()
+	if !bytes.HasPrefix(line, dataTag) {
+		t.Fatalf("line does not start with data tag: %q", string(line))
+	}
+	payload := bytes.TrimSpace(line[len(dataTag):])
+	return gjson.GetBytes(payload, "item_id").String()
+}
+
+func normalizedSSENestedItemID(t *testing.T, line []byte) string {
+	t.Helper()
+	if !bytes.HasPrefix(line, dataTag) {
+		t.Fatalf("line does not start with data tag: %q", string(line))
+	}
+	payload := bytes.TrimSpace(line[len(dataTag):])
+	return gjson.GetBytes(payload, "item.id").String()
+}
+
+func TestGitHubCopilotResponsesSSENormalizer_UsesOutputItemIDForReasoningEvents(t *testing.T) {
+	t.Parallel()
+
+	normalizer := newGitHubCopilotResponsesSSENormalizer()
+	normalizedOutputItem := normalizer.NormalizeLine([]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"reasoning-item-id","type":"reasoning"}}`))
+	if len(normalizedOutputItem) != 1 {
+		t.Fatalf("output_item.added events = %d, want 1", len(normalizedOutputItem))
+	}
+
+	added := normalizer.NormalizeLine([]byte(`data: {"type":"response.reasoning_summary_part.added","item_id":"upstream-added-id","output_index":0,"summary_index":0}`))
+	if len(added) != 1 {
+		t.Fatalf("added events = %d, want 1", len(added))
+	}
+	if got := normalizedSSEItemID(t, added[0]); got != "reasoning-item-id" {
+		t.Fatalf("added item_id = %q, want reasoning-item-id", got)
+	}
+
+	delta := normalizer.NormalizeLine([]byte(`data: {"type":"response.reasoning_summary_text.delta","item_id":"upstream-delta-id","output_index":0,"summary_index":0,"delta":"x"}`))
+	if len(delta) != 1 {
+		t.Fatalf("delta events = %d, want 1", len(delta))
+	}
+	if got := normalizedSSEItemID(t, delta[0]); got != "reasoning-item-id" {
+		t.Fatalf("delta item_id = %q, want reasoning-item-id", got)
+	}
+
+	done := normalizer.NormalizeLine([]byte(`data: {"type":"response.reasoning_summary_part.done","item_id":"upstream-done-id","output_index":0,"summary_index":0}`))
+	if len(done) != 1 {
+		t.Fatalf("done events = %d, want 1", len(done))
+	}
+	if got := normalizedSSEItemID(t, done[0]); got != "reasoning-item-id" {
+		t.Fatalf("done item_id = %q, want reasoning-item-id", got)
+	}
+}
+
+func TestGitHubCopilotResponsesSSENormalizer_UsesOutputItemIDForContentEvents(t *testing.T) {
+	t.Parallel()
+
+	normalizer := newGitHubCopilotResponsesSSENormalizer()
+	normalizedOutputItem := normalizer.NormalizeLine([]byte(`data: {"type":"response.output_item.added","output_index":1,"item":{"id":"message-item-id","type":"message"}}`))
+	if len(normalizedOutputItem) != 1 {
+		t.Fatalf("output_item.added events = %d, want 1", len(normalizedOutputItem))
+	}
+
+	added := normalizer.NormalizeLine([]byte(`data: {"type":"response.content_part.added","item_id":"content-added","output_index":1,"content_index":0}`))
+	if len(added) != 1 {
+		t.Fatalf("content added events = %d, want 1", len(added))
+	}
+	if got := normalizedSSEItemID(t, added[0]); got != "message-item-id" {
+		t.Fatalf("content added item_id = %q, want message-item-id", got)
+	}
+
+	delta := normalizer.NormalizeLine([]byte(`data: {"type":"response.output_text.delta","item_id":"content-delta","output_index":1,"content_index":0,"delta":"hello"}`))
+	if len(delta) != 1 {
+		t.Fatalf("output_text delta events = %d, want 1", len(delta))
+	}
+	if got := normalizedSSEItemID(t, delta[0]); got != "message-item-id" {
+		t.Fatalf("output_text delta item_id = %q, want message-item-id", got)
+	}
+
+	other := normalizer.NormalizeLine([]byte(`data: {"type":"response.output_text.delta","item_id":"other-content","output_index":2,"content_index":0,"delta":"world"}`))
+	if len(other) != 0 {
+		t.Fatalf("expected unresolved output_index event to be buffered, got %d events", len(other))
+	}
+}
+
+func TestGitHubCopilotResponsesSSENormalizer_BuffersUntilOutputItemAdded(t *testing.T) {
+	t.Parallel()
+
+	normalizer := newGitHubCopilotResponsesSSENormalizer()
+
+	buffered := normalizer.NormalizeLine([]byte(`data: {"type":"response.output_text.delta","item_id":"upstream-message-id","output_index":3,"content_index":0,"delta":"Hello"}`))
+	if len(buffered) != 0 {
+		t.Fatalf("buffered unresolved event count = %d, want 0", len(buffered))
+	}
+
+	flushed := normalizer.NormalizeLine([]byte(`data: {"type":"response.output_item.added","output_index":3,"item":{"id":"real-message-id","type":"message"}}`))
+	if len(flushed) != 2 {
+		t.Fatalf("flushed events = %d, want 2 (output_item.added + buffered delta)", len(flushed))
+	}
+	if got := normalizedSSEItemID(t, flushed[1]); got != "real-message-id" {
+		t.Fatalf("flushed buffered delta item_id = %q, want real-message-id", got)
+	}
+}
+
+func TestGitHubCopilotResponsesSSENormalizer_UsesAddedIDWhenDoneIDDiffers(t *testing.T) {
+	t.Parallel()
+
+	normalizer := newGitHubCopilotResponsesSSENormalizer()
+	normalizer.NormalizeLine([]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"canonical-added-id","type":"reasoning"}}`))
+
+	normalizedDone := normalizer.NormalizeLine([]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"mismatched-done-id","type":"reasoning"}}`))
+	if len(normalizedDone) != 1 {
+		t.Fatalf("output_item.done events = %d, want 1", len(normalizedDone))
+	}
+	if got := normalizedSSENestedItemID(t, normalizedDone[0]); got != "canonical-added-id" {
+		t.Fatalf("output_item.done item.id = %q, want canonical-added-id", got)
+	}
+
+	lateSummary := normalizer.NormalizeLine([]byte(`data: {"type":"response.reasoning_summary_part.added","item_id":"late-upstream-id","output_index":0,"summary_index":1}`))
+	if len(lateSummary) != 1 {
+		t.Fatalf("late reasoning summary events = %d, want 1", len(lateSummary))
+	}
+	if got := normalizedSSEItemID(t, lateSummary[0]); got != "canonical-added-id" {
+		t.Fatalf("late reasoning summary item_id = %q, want canonical-added-id", got)
+	}
+}
+
+func TestGitHubCopilotResponsesSSENormalizer_SynthesizesAddedWhenOnlyDoneSeen(t *testing.T) {
+	t.Parallel()
+
+	normalizer := newGitHubCopilotResponsesSSENormalizer()
+
+	buffered := normalizer.NormalizeLine([]byte(`data: {"type":"response.reasoning_summary_part.added","item_id":"upstream-id","output_index":7,"summary_index":1}`))
+	if len(buffered) != 0 {
+		t.Fatalf("buffered unresolved summary count = %d, want 0", len(buffered))
+	}
+
+	flushed := normalizer.NormalizeLine([]byte(`data: {"type":"response.output_item.done","output_index":7,"item":{"id":"done-only-id","type":"reasoning"}}`))
+	if len(flushed) != 3 {
+		t.Fatalf("flushed events = %d, want 3 (synthetic added + buffered summary + done)", len(flushed))
+	}
+	if got := gjson.GetBytes(bytes.TrimSpace(flushed[0][len(dataTag):]), "type").String(); got != "response.output_item.added" {
+		t.Fatalf("first flushed event type = %q, want response.output_item.added", got)
+	}
+	if got := normalizedSSEItemID(t, flushed[1]); got != "done-only-id" {
+		t.Fatalf("flushed buffered summary item_id = %q, want done-only-id", got)
+	}
+	if got := gjson.GetBytes(bytes.TrimSpace(flushed[2][len(dataTag):]), "type").String(); got != "response.output_item.done" {
+		t.Fatalf("last flushed event type = %q, want response.output_item.done", got)
+	}
+}
+
+func TestGitHubCopilotResponsesSSENormalizer_NonDataLineUnchanged(t *testing.T) {
+	t.Parallel()
+
+	normalizer := newGitHubCopilotResponsesSSENormalizer()
+	line := []byte("event: response.output_text.delta")
+	normalized := normalizer.NormalizeLine(line)
+	if len(normalized) != 1 {
+		t.Fatalf("non-data line normalized count = %d, want 1", len(normalized))
+	}
+	if string(normalized[0]) != string(line) {
+		t.Fatalf("non-data line changed: got %q want %q", string(normalized[0]), string(line))
+	}
+}
 
 func TestGitHubCopilotNormalizeModel_StripsSuffix(t *testing.T) {
 	t.Parallel()
