@@ -67,7 +67,9 @@ func (p *ThinkingTagParser) Process(payload []byte) []byte {
 		return payload
 	}
 
-	log.Debugf("antigravity executor: thinking tag parser processing payload (%d bytes), inThinking=%v, tagBuffer=%q", len(payload), p.inThinking, p.tagBuffer)
+	if p.inThinking {
+		log.Debugf("antigravity executor: thinking tag parser processing payload (%d bytes), inThinking=%v, tagBuffer=%q", len(payload), p.inThinking, p.tagBuffer)
+	}
 
 	partsResult := gjson.GetBytes(payload, "response.candidates.0.content.parts")
 	if !partsResult.Exists() || !partsResult.IsArray() {
