@@ -56,7 +56,7 @@ To get a token from Kiro IDE:
 **Additional flags:**
 
 | Flag | Description |
-|------|-------------|
+| --- | --- |
 | `--no-browser` | Don't open browser automatically, print URL instead |
 | `--no-incognito` | Use existing browser session (Kiro defaults to incognito). Useful for corporate SSO that requires an authenticated browser session |
 | `--kiro-idc-start-url` | IDC Start URL (required with `--kiro-idc-login`) |
@@ -72,6 +72,7 @@ http://your-server:8080/v0/oauth/kiro
 ```
 
 This provides a browser-based OAuth flow for Kiro (AWS CodeWhisperer) authentication with:
+
 - AWS Builder ID login
 - AWS Identity Center (IDC) login
 - Token import from Kiro IDE
@@ -130,6 +131,26 @@ docker compose pull && docker compose up -d
 This project only accepts pull requests that relate to third-party provider support. Any pull requests unrelated to third-party provider support will be rejected.
 
 If you need to submit any non-third-party provider changes, please open them against the [mainline](https://github.com/router-for-me/CLIProxyAPI) repository.
+
+## Build for Ubuntu (Local)
+
+Build a Linux binary for Ubuntu:
+
+```bash
+./build.sh --linux
+```
+
+This generates:
+
+```bash
+cli-proxy-api-plus_v6.8.37-0-0-plus_linux_<current-arch>
+```
+
+Build for Ubuntu ARM64:
+
+```bash
+TARGET_ARCH=arm64 ./build.sh --linux
+```
 
 ## License
 

@@ -1,0 +1,16 @@
+{
+  "access_token": "...",
+  "auth_method": "builder-id",
+  "client_id": "...",
+  "client_id_hash": "",
+  "client_secret": "...",
+  "disabled": false,
+  "email": "...",
+  "expires_at": "2026-03-02T01:01:34-05:00",
+  "profile_arn": "",
+  "provider": "AWS",
+  "refresh_token": "...",
+  "region": "...",
+  "start_url": "",
+  "type": "kiro"
+}
